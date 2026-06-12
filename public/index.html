@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Swing Scanner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="logo">
+          <span class="logo-mark">⟁</span>
+          <span class="logo-text">SWING<span class="logo-accent">SCAN</span></span>
+        </div>
+        <p class="tagline">Uptrend &rarr; Pullback &rarr; Breakout</p>
+      </div>
+      <div class="topbar-right">
+        <div class="status" id="status">
+          <span class="status-dot" id="statusDot"></span>
+          <span id="statusText">Loading…</span>
+        </div>
+        <button class="refresh-btn" id="refreshBtn">
+          <span class="refresh-icon" id="refreshIcon">&#10227;</span>
+          Refresh now
+        </button>
+      </div>
+    </header>
+
+    <section class="summary" id="summary"></section>
+
+    <section class="controls">
+      <div class="sort-group">
+        <label for="sortSelect">Sort by</label>
+        <select id="sortSelect">
+          <option value="score">Setup score</option>
+          <option value="oneMonthChange">1-month change</option>
+          <option value="sixMonthChange">6-month change</option>
+          <option value="adr">ADR %</option>
+          <option value="dollarVolume">Dollar volume</option>
+        </select>
+      </div>
+      <div class="legend">
+        <span class="legend-item"><span class="legend-swatch swatch-uptrend"></span>Uptrend</span>
+        <span class="legend-item"><span class="legend-swatch swatch-pullback"></span>Pullback</span>
+        <span class="legend-item"><span class="legend-swatch swatch-breakout"></span>Breakout</span>
+      </div>
+    </section>
+
+    <main class="grid" id="grid">
+      <!-- cards injected here -->
+    </main>
+
+    <div class="modal-backdrop" id="modalBackdrop">
+      <div class="modal" id="modal">
+        <button class="modal-close" id="modalClose">&times;</button>
+        <div id="modalContent"></div>
+      </div>
+    </div>
+
+    <footer class="footer">
+      <p>Data via Financial Modeling Prep. Educational tool only — not financial advice. Verify all setups before trading.</p>
+    </footer>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/lightweight-charts/4.1.3/lightweight-charts.standalone.production.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

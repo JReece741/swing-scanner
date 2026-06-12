@@ -1,0 +1,12 @@
+{
+  "name": "swing-scanner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Swing trade setup scanner: uptrend -> pullback -> breakout pattern scoring",
+  "scripts": {
+    "scan": "node scripts/run-scan.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
