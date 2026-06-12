@@ -13,7 +13,6 @@
 //       Stage 3: Breakout (price above consolidation range + volume surge)
 //  4. Return a ranked list with per-stage scores + reasons.
 
-const FMP_BASE = 'https://financialmodelingprep.com/api/v3';
 const FMP_STABLE = 'https://financialmodelingprep.com/stable';
 
 // ---- Tunables -------------------------------------------------------------
@@ -72,54 +71,82 @@ async function fmpFetch(url) {
 }
 
 // Pull sector performance to determine "bullish sectors" dynamically.
-// FMP stable endpoint: /sector-performance-snapshot (1 day) -- we use the
-// most recent snapshot and pick sectors with positive avg change.
+// FMP stable endpoint requires a `date` param (most recent trading day).
+// We try the last few calendar days until one returns data, since weekends
+// and holidays have no snapshot.
 async function getBullishSectors(apiKey) {
-  try {
-    const data = await fmpFetch(
-      `${FMP_STABLE}/sector-performance-snapshot?apikey=${apiKey}`
-    );
-    if (!Array.isArray(data) || data.length === 0) return FALLBACK_BULLISH_SECTORS;
-    const bullish = data
-      .filter((s) => parseFloat(s.changesPercentage) > 0)
-      .map((s) => s.sector);
-    return bullish.length ? bullish : FALLBACK_BULLISH_SECTORS;
-  } catch (e) {
-    console.warn('Sector performance fetch failed, using fallback list:', e.message);
-    return FALLBACK_BULLISH_SECTORS;
+  for (let daysAgo = 1; daysAgo <= 5; daysAgo++) {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() - daysAgo);
+    const dateStr = d.toISOString().slice(0, 10);
+
+    try {
+      const data = await fmpFetch(
+        `${FMP_STABLE}/sector-performance-snapshot?date=${dateStr}&apikey=${apiKey}`
+      );
+      if (!Array.isArray(data) || data.length === 0) continue;
+
+      const bullish = data
+        .filter((s) => parseFloat(s.averageChange ?? s.changesPercentage) > 0)
+        .map((s) => s.sector);
+
+      if (bullish.length) return bullish;
+    } catch (e) {
+      console.warn(`Sector performance fetch failed for ${dateStr}:`, e.message);
+    }
   }
+
+  console.warn('Sector performance unavailable after retries, using fallback list.');
+  return FALLBACK_BULLISH_SECTORS;
 }
 
 // Run the FMP stock screener with our base liquidity/price/momentum filters.
 // Sector filtering is applied after, since the screener endpoint only accepts
 // a single sector value at a time.
 async function runScreener(apiKey, bullishSectors) {
-  const params = new URLSearchParams({
-    priceMoreThan: String(FILTERS.minPrice),
-    volumeMoreThan: '500000', // rough pre-filter; refined later with price*vol
-    isActivelyTrading: 'true',
-    exchange: 'NASDAQ,NYSE,AMEX',
-    limit: '1000',
-    apikey: apiKey,
-  });
+  const exchanges = ['NASDAQ', 'NYSE', 'AMEX'];
+  const seen = new Map();
 
-  const results = await fmpFetch(`${FMP_BASE}/stock-screener?${params.toString()}`);
+  for (const exchange of exchanges) {
+    const params = new URLSearchParams({
+      priceMoreThan: String(FILTERS.minPrice),
+      volumeMoreThan: '500000', // rough pre-filter; refined later with price*vol
+      isActivelyTrading: 'true',
+      exchange,
+      limit: '1000',
+      apikey: apiKey,
+    });
 
-  return results.filter((r) => bullishSectors.includes(r.sector));
+    try {
+      const results = await fmpFetch(`${FMP_STABLE}/company-screener?${params.toString()}`);
+      for (const r of results) {
+        if (!seen.has(r.symbol)) seen.set(r.symbol, r);
+      }
+    } catch (e) {
+      console.warn(`Screener fetch failed for exchange ${exchange}: ${e.message}`);
+    }
+  }
+
+  const all = Array.from(seen.values());
+  return all.filter((r) => bullishSectors.includes(r.sector));
 }
 
 // Get ~9 months of daily candles for a symbol.
 async function getDailyBars(apiKey, symbol) {
+  const to = new Date();
+  const from = new Date();
+  from.setUTCDate(from.getUTCDate() - 280); // ~9 months calendar days, covers ~190 trading days
+
   const params = new URLSearchParams({
-    timeseries: '190', // trading days, ~9 months
+    symbol,
+    from: from.toISOString().slice(0, 10),
+    to: to.toISOString().slice(0, 10),
     apikey: apiKey,
   });
-  const data = await fmpFetch(
-    `${FMP_BASE}/historical-price-full/${symbol}?${params.toString()}`
-  );
-  if (!data || !data.historical) return null;
+  const data = await fmpFetch(`${FMP_STABLE}/historical-price-eod/full?${params.toString()}`);
+  if (!Array.isArray(data) || data.length === 0) return null;
   // FMP returns most-recent-first; reverse to chronological order.
-  const bars = data.historical
+  const bars = data
     .slice()
     .reverse()
     .map((b) => ({
