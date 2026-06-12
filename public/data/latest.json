@@ -1,6 +1,16 @@
 {
-  "generatedAt": null,
-  "bullishSectors": [],
+  "generatedAt": "2026-06-12T21:48:20.520Z",
+  "bullishSectors": [
+    "Basic Materials",
+    "Communication Services",
+    "Consumer Cyclical",
+    "Financial Services",
+    "Healthcare",
+    "Industrials",
+    "Real Estate",
+    "Technology",
+    "Utilities"
+  ],
   "totalScreened": 0,
   "totalQualified": 0,
   "results": []
