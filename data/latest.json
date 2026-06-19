@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-06-19T12:34:25.938Z",
+  "generatedAt": "2026-06-19T18:34:26.995Z",
   "bullishSectors": [
     "Communication Services",
     "Consumer Cyclical",
@@ -8,5 +8,11 @@
   ],
   "totalScreened": 0,
   "totalQualified": 0,
+  "debug": [
+    "NASDAQ fetch failed: FMP request failed (402): https://financialmodelingprep.com/stable/company-screener?marketCapMoreThan=50000000&country=US&isActivelyTrading=true&isEtf=false&isFund=false&exchange=NASDAQ&limit=1000&apikey=q1zp3JmwLyyQ60vaOplyXoIauYMyCAiL\nRestricted Endpoint: This endpoint is not available under your current subscription please visit our subscription page to upgrade your plan at https://financialmodelingprep.com/",
+    "NYSE fetch failed: FMP request failed (402): https://financialmodelingprep.com/stable/company-screener?marketCapMoreThan=50000000&country=US&isActivelyTrading=true&isEtf=false&isFund=false&exchange=NYSE&limit=1000&apikey=q1zp3JmwLyyQ60vaOplyXoIauYMyCAiL\nRestricted Endpoint: This endpoint is not available under your current subscription please visit our subscription page to upgrade your plan at https://financialmodelingprep.com/",
+    "AMEX fetch failed: FMP request failed (402): https://financialmodelingprep.com/stable/company-screener?marketCapMoreThan=50000000&country=US&isActivelyTrading=true&isEtf=false&isFund=false&exchange=AMEX&limit=1000&apikey=q1zp3JmwLyyQ60vaOplyXoIauYMyCAiL\nRestricted Endpoint: This endpoint is not available under your current subscription please visit our subscription page to upgrade your plan at https://financialmodelingprep.com/",
+    "Total unique: 0, after sector filter: 0"
+  ],
   "results": []
 }
