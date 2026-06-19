@@ -1,38 +1,35 @@
-// scanner.js
-// Core scanning + scoring logic, shared between the GitHub Action (Node)
-// and the Vercel serverless "refresh now" endpoint.
-//
-// Strategy:
-//  1. Use FMP's stock-screener endpoint to pull a broad list of US stocks
-//     matching the basic liquidity/price/momentum filters.
-//  2. For each candidate, pull ~9 months of daily OHLCV.
-//  3. Compute 10/20 SMA, then score the 3-stage pattern:
-//       Stage 1: Strong uptrend (20%+ move, both SMAs rising, HH/HL)
-//       Stage 2: Pullback & consolidation toward SMA10/20, tightening range,
-//                volume declining
-//       Stage 3: Breakout (price above consolidation range + volume surge)
-//  4. Return a ranked list with per-stage scores + reasons.
+// scanner.js — Swing trade setup scanner
+// 
+// Strategy (working around FMP free tier limitations):
+//  1. stable/stock-list  → free, returns all US stocks with exchange/sector/price.
+//     Filter to US exchanges, price > $1, known sector.
+//  2. stable/batch-quote → free bulk quote endpoint; fetch in batches of 50 symbols
+//     to get current price, volume, and 1-day change cheaply.
+//     Apply dollar-volume filter (price * volume > $30M) and 1-month change proxy.
+//  3. stable/historical-price-eod/full → for surviving candidates only (~top 150),
+//     fetch 9 months of OHLCV and run the full pattern score + ADR filter.
+//  4. Return ranked results.
 
 const FMP_STABLE = 'https://financialmodelingprep.com/stable';
 
-// ---- Tunables -------------------------------------------------------------
+// ---- Tunables ---------------------------------------------------------------
 
 const FILTERS = {
-  minPrice: 1,
-  minAvgDollarVolume: 30_000_000, // price * volume > $30M
-  minOneMonthChange: 5, // %
-  adrMin: 5, // Average Daily Range %, > 5%
-  minHistoryDays: 130, // ~6 months of trading days
+  minPrice:           1,           // price > $1
+  minDollarVolume:    30_000_000,  // price * volume > $30M
+  minOneMonthChange:  5,           // % (approximated from 20-day history)
+  adrMin:             5,           // Average Daily Range % > 5%
+  minHistoryDays:     120,         // ~6 months of trading days
+  maxCandidates:      80,          // max symbols to fetch full history for (API budget)
 };
 
-// Sectors considered "bullish" are determined dynamically (see getBullishSectors),
-// but we keep a fallback list in case the sector-performance call fails.
+const TARGET_EXCHANGES = new Set(['NASDAQ', 'NYSE', 'AMEX', 'NASDAQ Global Select',
+  'Nasdaq Global Select', 'Nasdaq Capital Market', 'New York Stock Exchange',
+  'NYSE American', 'NYSE Arca', 'nasdaq', 'nyse', 'amex']);
+
 const FALLBACK_BULLISH_SECTORS = [
-  'Technology',
-  'Industrials',
-  'Healthcare',
-  'Financial Services',
-  'Communication Services',
+  'Technology', 'Industrials', 'Healthcare',
+  'Financial Services', 'Communication Services',
 ];
 
 // ---- Helpers ----------------------------------------------------------------
@@ -48,138 +45,132 @@ function sma(values, period) {
 }
 
 function pctChange(a, b) {
-  if (a === 0) return 0;
+  if (!a || a === 0) return 0;
   return ((b - a) / a) * 100;
 }
 
-// Average Daily Range % over last `period` days: avg((high-low)/low * 100)
 function averageDailyRange(bars, period = 14) {
   const slice = bars.slice(-period);
-  const adrs = slice.map((b) => ((b.high - b.low) / b.low) * 100);
+  const adrs = slice.map(b => ((b.high - b.low) / (b.low || 1)) * 100);
   return adrs.reduce((s, v) => s + v, 0) / adrs.length;
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 // ---- FMP fetchers -----------------------------------------------------------
 
-async function fmpFetch(url) {
+async function fmpFetch(url, debug, label) {
   const res = await fetch(url);
+  const body = await res.text();
   if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`FMP request failed (${res.status}): ${url}\n${body.slice(0, 300)}`);
+    const msg = `FMP ${res.status} ${label || ''}: ${body.slice(0, 200)}`;
+    if (debug) debug.push(msg);
+    throw new Error(msg);
   }
-  return res.json();
+  return JSON.parse(body);
 }
 
-// Pull sector performance to determine "bullish sectors" dynamically.
-// FMP stable endpoint requires a `date` param (most recent trading day).
-// We try the last few calendar days until one returns data, since weekends
-// and holidays have no snapshot.
-async function getBullishSectors(apiKey) {
+// Sector performance — find bullish sectors from last trading day
+async function getBullishSectors(apiKey, debug) {
   for (let daysAgo = 1; daysAgo <= 5; daysAgo++) {
     const d = new Date();
     d.setUTCDate(d.getUTCDate() - daysAgo);
     const dateStr = d.toISOString().slice(0, 10);
-
     try {
       const data = await fmpFetch(
-        `${FMP_STABLE}/sector-performance-snapshot?date=${dateStr}&apikey=${apiKey}`
+        `${FMP_STABLE}/sector-performance-snapshot?date=${dateStr}&apikey=${apiKey}`,
+        debug, `sector-perf ${dateStr}`
       );
-      if (!Array.isArray(data) || data.length === 0) continue;
-
+      if (!Array.isArray(data) || !data.length) continue;
       const bullish = data
-        .filter((s) => parseFloat(s.averageChange ?? s.changesPercentage) > 0)
-        .map((s) => s.sector);
-
-      if (bullish.length) return bullish;
+        .filter(s => parseFloat(s.averageChange ?? s.changesPercentage ?? 0) > 0)
+        .map(s => s.sector);
+      if (bullish.length) {
+        debug && debug.push(`Bullish sectors (${dateStr}): ${bullish.join(', ')}`);
+        return bullish;
+      }
     } catch (e) {
-      console.warn(`Sector performance fetch failed for ${dateStr}:`, e.message);
+      debug && debug.push(`Sector perf ${dateStr} failed: ${e.message.slice(0, 100)}`);
     }
   }
-
-  console.warn('Sector performance unavailable after retries, using fallback list.');
+  debug && debug.push('Using fallback bullish sectors');
   return FALLBACK_BULLISH_SECTORS;
 }
 
-// Run the FMP stable company-screener.
-// The stable endpoint supports: marketCapMoreThan, country, exchange,
-// isEtf, isFund, isActivelyTrading, sector, limit.
-// Price, volume, and ADR filters are applied afterwards on the historical data.
-async function runScreener(apiKey, bullishSectors, debug = []) {
-  const exchanges = ['NASDAQ', 'NYSE', 'AMEX'];
-  const seen = new Map();
-
-  for (const exchange of exchanges) {
-    const params = new URLSearchParams({
-      marketCapMoreThan: '50000000', // $50M+ market cap as a basic liquidity proxy
-      country: 'US',
-      isActivelyTrading: 'true',
-      isEtf: 'false',
-      isFund: 'false',
-      exchange,
-      limit: '1000',
-      apikey: apiKey,
-    });
-
-    try {
-      const results = await fmpFetch(`${FMP_STABLE}/company-screener?${params.toString()}`);
-      const count = Array.isArray(results) ? results.length : 'non-array';
-      debug.push(`${exchange}: ${count} results`);
-      if (Array.isArray(results)) {
-        for (const r of results) {
-          if (!seen.has(r.symbol)) seen.set(r.symbol, r);
-        }
-      } else {
-        debug.push(`${exchange} response sample: ${JSON.stringify(results).slice(0, 200)}`);
-      }
-    } catch (e) {
-      debug.push(`${exchange} fetch failed: ${e.message}`);
-    }
+// Step 1: Get full stock list (free endpoint)
+async function getStockList(apiKey, debug) {
+  const data = await fmpFetch(
+    `${FMP_STABLE}/stock-list?apikey=${apiKey}`,
+    debug, 'stock-list'
+  );
+  if (!Array.isArray(data)) {
+    debug && debug.push(`stock-list returned non-array: ${JSON.stringify(data).slice(0, 100)}`);
+    return [];
   }
-
-  const all = Array.from(seen.values());
-  const sectorFiltered = all.filter((r) => bullishSectors.includes(r.sector));
-
-  debug.push(`Total unique: ${all.length}, after sector filter: ${sectorFiltered.length}`);
-  if (all.length > 0) {
-    const sampleSectors = [...new Set(all.slice(0, 100).map((r) => r.sector))].filter(Boolean);
-    debug.push(`Sample sectors: ${sampleSectors.join(', ')}`);
-  }
-
-  return sectorFiltered;
+  debug && debug.push(`stock-list: ${data.length} total symbols`);
+  return data;
 }
 
-// Get ~9 months of daily candles for a symbol.
-async function getDailyBars(apiKey, symbol) {
+// Step 2: Batch quotes — fetch current price/volume for up to 50 symbols at once
+async function getBatchQuotes(symbols, apiKey, debug) {
+  const results = new Map();
+  const batchSize = 50;
+  for (let i = 0; i < symbols.length; i += batchSize) {
+    const batch = symbols.slice(i, i + batchSize).join(',');
+    try {
+      const data = await fmpFetch(
+        `${FMP_STABLE}/batch-quote?symbols=${encodeURIComponent(batch)}&apikey=${apiKey}`,
+        null, 'batch-quote'
+      );
+      if (Array.isArray(data)) {
+        for (const q of data) results.set(q.symbol, q);
+      }
+    } catch (e) {
+      // batch-quote might also need a different approach — try quote-short as fallback
+      try {
+        const data2 = await fmpFetch(
+          `${FMP_STABLE}/quote?symbols=${encodeURIComponent(batch)}&apikey=${apiKey}`,
+          null, 'quote'
+        );
+        if (Array.isArray(data2)) {
+          for (const q of data2) results.set(q.symbol, q);
+        }
+      } catch (e2) {
+        debug && debug.push(`batch-quote failed for batch ${i}: ${e2.message.slice(0, 80)}`);
+      }
+    }
+    await sleep(120); // be gentle on rate limits (250/day = ~1 per 5min, but batching helps)
+  }
+  return results;
+}
+
+// Step 3: Historical OHLCV
+async function getDailyBars(symbol, apiKey) {
   const to = new Date();
   const from = new Date();
-  from.setUTCDate(from.getUTCDate() - 280); // ~9 months calendar days, covers ~190 trading days
+  from.setUTCDate(from.getUTCDate() - 280); // ~9 calendar months
 
   const params = new URLSearchParams({
     symbol,
     from: from.toISOString().slice(0, 10),
-    to: to.toISOString().slice(0, 10),
+    to:   to.toISOString().slice(0, 10),
     apikey: apiKey,
   });
-  const data = await fmpFetch(`${FMP_STABLE}/historical-price-eod/full?${params.toString()}`);
-  if (!Array.isArray(data) || data.length === 0) return null;
-  // FMP returns most-recent-first; reverse to chronological order.
-  const bars = data
-    .slice()
-    .reverse()
-    .map((b) => ({
-      date: b.date,
-      open: b.open,
-      high: b.high,
-      low: b.low,
-      close: b.close,
-      volume: b.volume,
-    }));
-  return bars;
+  const data = await fmpFetch(
+    `${FMP_STABLE}/historical-price-eod/full?${params}`,
+    null, `history-${symbol}`
+  );
+  if (!Array.isArray(data) || !data.length) return null;
+  return data.slice().reverse().map(b => ({
+    date: b.date, open: b.open, high: b.high,
+    low: b.low, close: b.close, volume: b.volume,
+  }));
 }
 
-// ---- Pattern scoring ---------------------------------------------------------
+// ---- Pattern scoring --------------------------------------------------------
 
-// Score the 3-stage swing setup. Returns { score, stages, reasons }
 function scorePattern(bars) {
   const reasons = [];
   const stages = { uptrend: 0, pullback: 0, breakout: 0 };
@@ -188,187 +179,166 @@ function scorePattern(bars) {
     return { score: 0, stages, reasons: ['Insufficient history'] };
   }
 
-  const closes = bars.map((b) => b.close);
-  const volumes = bars.map((b) => b.volume);
-  const sma10 = sma(closes, 10);
-  const sma20 = sma(closes, 20);
+  const closes  = bars.map(b => b.close);
+  const volumes = bars.map(b => b.volume);
+  const sma10   = sma(closes, 10);
+  const sma20   = sma(closes, 20);
+  const n       = bars.length;
+  const last    = n - 1;
 
-  const n = bars.length;
-  const last = n - 1;
-
-  // ---------- Stage 3: Breakout (most recent) ----------
-  // Look at the last ~5 bars for a breakout above a recent consolidation high,
-  // accompanied by a volume surge vs the prior 20-bar average.
-  const breakoutWindow = 5;
-  const consolidationLookback = 30; // bars used to define the "range" being broken
+  // ---- Stage 3: Breakout (most recent 5 bars) ----
+  const breakoutWindow       = 5;
+  const consolidationLookback = 30;
   let breakoutScore = 0;
 
-  const recentBars = bars.slice(last - breakoutWindow + 1, last + 1);
   const priorRangeBars = bars.slice(
     last - breakoutWindow - consolidationLookback + 1,
     last - breakoutWindow + 1
   );
-  const avgVolPrior20 =
-    volumes.slice(last - 20, last).reduce((s, v) => s + v, 0) / 20;
+  const avgVolPrior20 = volumes.slice(last - 20, last).reduce((s, v) => s + v, 0) / 20;
 
   if (priorRangeBars.length > 0) {
-    const consolHigh = Math.max(...priorRangeBars.map((b) => b.high));
+    const consolHigh  = Math.max(...priorRangeBars.map(b => b.high));
     const breakoutBar = bars[last];
-    const brokeOut = breakoutBar.close > consolHigh;
-    const volSurge = breakoutBar.volume > avgVolPrior20 * 1.5;
+    const brokeOut    = breakoutBar.close > consolHigh;
+    const volSurge    = breakoutBar.volume > avgVolPrior20 * 1.5;
 
     if (brokeOut) {
       breakoutScore += 50;
-      reasons.push(
-        `Price (${breakoutBar.close.toFixed(2)}) broke above consolidation high (${consolHigh.toFixed(2)})`
-      );
+      reasons.push(`Price ($${breakoutBar.close.toFixed(2)}) broke above consolidation high ($${consolHigh.toFixed(2)})`);
     } else {
-      const distToBreak = pctChange(breakoutBar.close, consolHigh);
-      if (distToBreak < 3) {
+      const distPct = pctChange(breakoutBar.close, consolHigh);
+      if (distPct < 3) {
         breakoutScore += 25;
-        reasons.push(`Price within 3% of consolidation high (setup forming)`);
+        reasons.push(`Price within 3% of consolidation high — setup forming`);
       }
     }
     if (volSurge) {
       breakoutScore += 50;
-      reasons.push(
-        `Volume surge: ${(breakoutBar.volume / avgVolPrior20).toFixed(1)}x the 20-day average`
-      );
+      reasons.push(`Volume surge: ${(breakoutBar.volume / avgVolPrior20).toFixed(1)}× 20-day avg`);
     } else if (brokeOut) {
-      reasons.push('Breakout lacks strong volume confirmation');
+      reasons.push('Breakout lacks volume confirmation');
     }
   }
   stages.breakout = Math.min(100, breakoutScore);
 
-  // ---------- Stage 1: Strong uptrend (look back further) ----------
-  // Find a prior up-leg of >= 20% within the last ~90 bars, with SMA10 and
-  // SMA20 both rising at the time, and higher-highs/higher-lows structure.
+  // ---- Stage 1: Uptrend (look at bars 25–115 ago) ----
   let uptrendScore = 0;
   const uptrendLookback = Math.min(90, n - 25);
-  const segment = bars.slice(n - uptrendLookback - 20, n - 20); // exclude the most recent consolidation/breakout zone
+  const segment = bars.slice(n - uptrendLookback - 20, n - 20);
 
   if (segment.length > 10) {
-    const segCloses = segment.map((b) => b.close);
-    const segLow = Math.min(...segCloses.slice(0, Math.floor(segCloses.length / 2)));
-    const segHigh = Math.max(...segCloses.slice(Math.floor(segCloses.length / 2)));
-    const move = pctChange(segLow, segHigh);
+    const segCloses = segment.map(b => b.close);
+    const half      = Math.floor(segCloses.length / 2);
+    const segLow    = Math.min(...segCloses.slice(0, half));
+    const segHigh   = Math.max(...segCloses.slice(half));
+    const move      = pctChange(segLow, segHigh);
 
-    if (move >= 20) {
-      uptrendScore += 50;
-      reasons.push(`Prior uptrend move of ${move.toFixed(1)}% detected`);
-    } else if (move >= 10) {
-      uptrendScore += 25;
-      reasons.push(`Prior uptrend move of ${move.toFixed(1)}% (below 20% target)`);
+    if (move >= 20)      { uptrendScore += 50; reasons.push(`Prior uptrend: +${move.toFixed(1)}%`); }
+    else if (move >= 10) { uptrendScore += 25; reasons.push(`Partial uptrend: +${move.toFixed(1)}% (below 20% target)`); }
+
+    const segStartIdx = Math.max(0, n - uptrendLookback - 20);
+    const segEndIdx   = Math.max(0, n - 20);
+    if (sma10[segStartIdx] != null && sma10[segEndIdx] != null) {
+      const s10Up = sma10[segEndIdx] > sma10[segStartIdx];
+      const s20Up = sma20[segEndIdx] > sma20[segStartIdx];
+      if (s10Up && s20Up) { uptrendScore += 30; reasons.push('Both SMA10 and SMA20 rising during uptrend'); }
+      else if (s10Up || s20Up) { uptrendScore += 15; }
     }
 
-    // SMA slope check using start/end of segment in the sma10/sma20 arrays
-    const segStartIdx = n - uptrendLookback - 20;
-    const segEndIdx = n - 20;
-    if (
-      sma10[segStartIdx] != null &&
-      sma10[segEndIdx] != null &&
-      sma20[segStartIdx] != null &&
-      sma20[segEndIdx] != null
-    ) {
-      const sma10Rising = sma10[segEndIdx] > sma10[segStartIdx];
-      const sma20Rising = sma20[segEndIdx] > sma20[segStartIdx];
-      if (sma10Rising && sma20Rising) {
-        uptrendScore += 30;
-        reasons.push('Both 10 SMA and 20 SMA were rising during the uptrend');
-      } else if (sma10Rising || sma20Rising) {
-        uptrendScore += 15;
-      }
-    }
-
-    // Higher highs / higher lows: compare first-half vs second-half highs/lows
-    const half = Math.floor(segment.length / 2);
-    const firstHalf = segment.slice(0, half);
-    const secondHalf = segment.slice(half);
-    const hh = Math.max(...secondHalf.map((b) => b.high)) > Math.max(...firstHalf.map((b) => b.high));
-    const hl = Math.min(...secondHalf.map((b) => b.low)) > Math.min(...firstHalf.map((b) => b.low));
-    if (hh && hl) {
-      uptrendScore += 20;
-      reasons.push('Higher highs and higher lows structure confirmed');
-    }
+    const firstH = segment.slice(0, half);
+    const secondH = segment.slice(half);
+    const hh = Math.max(...secondH.map(b => b.high)) > Math.max(...firstH.map(b => b.high));
+    const hl = Math.min(...secondH.map(b => b.low))  > Math.min(...firstH.map(b => b.low));
+    if (hh && hl) { uptrendScore += 20; reasons.push('Higher highs and higher lows confirmed'); }
   }
   stages.uptrend = Math.min(100, uptrendScore);
 
-  // ---------- Stage 2: Pullback & consolidation ----------
-  // Use the ~20-bar window just before the breakout window.
+  // ---- Stage 2: Pullback / consolidation ----
   let pullbackScore = 0;
-  const pullbackWindow = bars.slice(
+  const pullbackZone = bars.slice(
     last - breakoutWindow - consolidationLookback + 1,
     last - breakoutWindow + 1
   );
 
-  if (pullbackWindow.length >= 10) {
-    const highs = pullbackWindow.map((b) => b.high);
-    const lows = pullbackWindow.map((b) => b.low);
-    const volsInWindow = pullbackWindow.map((b) => b.volume);
+  if (pullbackZone.length >= 10) {
+    const highs    = pullbackZone.map(b => b.high);
+    const lows     = pullbackZone.map(b => b.low);
+    const pvols    = pullbackZone.map(b => b.volume);
+    const half     = Math.floor(pullbackZone.length / 2);
 
-    // Tightening range: compare range of first half vs second half
-    const half = Math.floor(pullbackWindow.length / 2);
-    const firstHalfRange = Math.max(...highs.slice(0, half)) - Math.min(...lows.slice(0, half));
-    const secondHalfRange = Math.max(...highs.slice(half)) - Math.min(...lows.slice(half));
-    const tightening = secondHalfRange < firstHalfRange;
-    if (tightening) {
-      pullbackScore += 25;
-      reasons.push('Trading range tightened during consolidation');
+    const r1 = Math.max(...highs.slice(0, half)) - Math.min(...lows.slice(0, half));
+    const r2 = Math.max(...highs.slice(half))     - Math.min(...lows.slice(half));
+    if (r2 < r1) { pullbackScore += 25; reasons.push('Range tightening during consolidation'); }
+
+    if (Math.min(...lows.slice(half)) > Math.min(...lows.slice(0, half))) {
+      pullbackScore += 25; reasons.push('Higher lows during consolidation');
+    }
+    if (Math.max(...highs.slice(half)) <= Math.max(...highs.slice(0, half)) * 1.02) {
+      pullbackScore += 20; reasons.push('Same or lower highs during consolidation');
     }
 
-    // Higher lows: second half low > first half low
-    const higherLows = Math.min(...lows.slice(half)) > Math.min(...lows.slice(0, half));
-    if (higherLows) {
-      pullbackScore += 25;
-      reasons.push('Higher lows during consolidation');
-    }
+    const avgV1 = pvols.slice(0, half).reduce((s, v) => s + v, 0) / half;
+    const avgV2 = pvols.slice(half).reduce((s, v) => s + v, 0) / (pvols.length - half);
+    if (avgV2 < avgV1) { pullbackScore += 30; reasons.push('Volume declining during consolidation'); }
 
-    // Same or lower highs: second half high <= first half high * 1.02
-    const sameOrLowerHighs = Math.max(...highs.slice(half)) <= Math.max(...highs.slice(0, half)) * 1.02;
-    if (sameOrLowerHighs) {
-      pullbackScore += 20;
-      reasons.push('Same or lower highs during consolidation');
-    }
-
-    // Volume declining: second half avg vol < first half avg vol
-    const avgVol1 = volsInWindow.slice(0, half).reduce((s, v) => s + v, 0) / half;
-    const avgVol2 = volsInWindow.slice(half).reduce((s, v) => s + v, 0) / (volsInWindow.length - half);
-    if (avgVol2 < avgVol1) {
-      pullbackScore += 30;
-      reasons.push('Volume declined during consolidation');
-    }
-
-    // Price near SMA10/20 at end of pullback window
     const endIdx = last - breakoutWindow;
-    if (sma10[endIdx] != null && sma20[endIdx] != null) {
+    if (sma10[endIdx] != null) {
       const px = bars[endIdx].close;
-      const nearSma10 = Math.abs(pctChange(sma10[endIdx], px)) < 5;
-      const nearSma20 = Math.abs(pctChange(sma20[endIdx], px)) < 5;
-      if (nearSma10 || nearSma20) {
-        pullbackScore = Math.min(100, pullbackScore + 0); // already weighted above, just informational
-        reasons.push('Price pulled back near the 10/20 SMA');
+      if (Math.abs(pctChange(sma10[endIdx], px)) < 5 || Math.abs(pctChange(sma20[endIdx], px)) < 5) {
+        reasons.push('Price pulled back near SMA10/20');
       }
     }
   }
   stages.pullback = Math.min(100, pullbackScore);
 
-  // ---------- Composite score ----------
-  // Weight: breakout matters most (it's the trigger), pullback second,
-  // uptrend confirms the overall structure.
-  const score = Math.round(
-    stages.breakout * 0.45 + stages.pullback * 0.35 + stages.uptrend * 0.2
-  );
-
+  const score = Math.round(stages.breakout * 0.45 + stages.pullback * 0.35 + stages.uptrend * 0.2);
   return { score, stages, reasons };
 }
 
-// ---- Main scan ---------------------------------------------------------------
+// ---- Main scan --------------------------------------------------------------
 
-async function scan(apiKey, { limit = 40, onProgress = null } = {}) {
+async function scan(apiKey, { limit = 40, onProgress = null, maxCandidatesOverride = null } = {}) {
+  const MAX_CANDIDATES = maxCandidatesOverride || FILTERS.maxCandidates;
   const debug = [];
-  const bullishSectors = await getBullishSectors(apiKey);
-  const candidates = await runScreener(apiKey, bullishSectors, debug);
 
+  // 1. Bullish sectors
+  const bullishSectors = await getBullishSectors(apiKey, debug);
+
+  // 2. Full stock list (free)
+  let stockList;
+  try {
+    stockList = await getStockList(apiKey, debug);
+  } catch (e) {
+    return { generatedAt: new Date().toISOString(), bullishSectors, totalScreened: 0,
+             totalQualified: 0, debug: [...debug, `stock-list fatal: ${e.message}`], results: [] };
+  }
+
+  // Pre-filter by exchange + sector + price from the list itself
+  const US_SECTORS = new Set([
+    'Technology','Industrials','Healthcare','Financial Services',
+    'Communication Services','Consumer Cyclical','Consumer Defensive',
+    'Basic Materials','Energy','Real Estate','Utilities',
+  ]);
+
+  const preFiltered = stockList.filter(s => {
+    if (!s.symbol || s.symbol.includes('.') || s.symbol.length > 5) return false;
+    const price = parseFloat(s.price) || 0;
+    if (price < FILTERS.minPrice) return false;
+    if (!bullishSectors.includes(s.sector)) return false;
+    // Exchange check — FMP stock-list uses exchangeShortName or exchange
+    const ex = (s.exchangeShortName || s.exchange || '').toUpperCase();
+    return ex === 'NASDAQ' || ex === 'NYSE' || ex === 'AMEX';
+  });
+
+  debug.push(`Pre-filtered to ${preFiltered.length} symbols (exchange + sector + price)`);
+
+  // Sort by price descending as a rough liquidity proxy, cap to save API calls
+  preFiltered.sort((a, b) => (parseFloat(b.price) || 0) - (parseFloat(a.price) || 0));
+  const candidates = preFiltered.slice(0, 500); // reasonable cap
+  debug.push(`Working candidate pool: ${candidates.length}`);
+
+  // 3. Fetch historical data for candidates, apply all filters
   const results = [];
   let processed = 0;
 
@@ -377,74 +347,66 @@ async function scan(apiKey, { limit = 40, onProgress = null } = {}) {
     if (onProgress) onProgress(processed, candidates.length, c.symbol);
 
     try {
-      const bars = await getDailyBars(apiKey, c.symbol);
+      await sleep(50); // gentle pacing
+      const bars = await getDailyBars(c.symbol, apiKey);
       if (!bars || bars.length < FILTERS.minHistoryDays) continue;
 
-      const last = bars[bars.length - 1];
-      const oneMonthAgo = bars[Math.max(0, bars.length - 22)];
-      const sixMonthAgo = bars[Math.max(0, bars.length - 130)];
+      const lastBar    = bars[bars.length - 1];
+      const mo1Bar     = bars[Math.max(0, bars.length - 22)];
+      const mo6Bar     = bars[Math.max(0, bars.length - 130)];
 
-      const dollarVolume = last.close * last.volume;
-      if (dollarVolume < FILTERS.minAvgDollarVolume) continue;
+      const dollarVol  = lastBar.close * lastBar.volume;
+      if (dollarVol < FILTERS.minDollarVolume) continue;
 
-      const oneMonthChange = pctChange(oneMonthAgo.close, last.close);
-      if (oneMonthChange < FILTERS.minOneMonthChange) continue;
-
-      const sixMonthChange = pctChange(sixMonthAgo.close, last.close);
+      const change1m   = pctChange(mo1Bar.close, lastBar.close);
+      if (change1m < FILTERS.minOneMonthChange) continue;
 
       const adr = averageDailyRange(bars);
       if (adr < FILTERS.adrMin) continue;
 
       const { score, stages, reasons } = scorePattern(bars);
-
-      const closes = bars.map((b) => b.close);
-      const sma10 = sma(closes, 10);
-      const sma20 = sma(closes, 20);
+      const closes = bars.map(b => b.close);
+      const sma10v = sma(closes, 10);
+      const sma20v = sma(closes, 20);
 
       results.push({
-        symbol: c.symbol,
-        name: c.name || c.companyName || c.symbol,
-        sector: c.sector,
-        industry: c.industry,
-        price: last.close,
-        dollarVolume,
-        oneMonthChange,
-        sixMonthChange,
+        symbol:        c.symbol,
+        name:          c.name || c.companyName || c.symbol,
+        sector:        c.sector,
+        industry:      c.industry || '',
+        price:         lastBar.close,
+        dollarVolume:  dollarVol,
+        oneMonthChange: change1m,
+        sixMonthChange: pctChange(mo6Bar.close, lastBar.close),
         adr,
         score,
         stages,
         reasons,
-        // Trimmed bar data + SMAs for charting (last 120 bars is plenty)
         bars: bars.slice(-120).map((b, i, arr) => {
-          const fullIdx = bars.length - arr.length + i;
-          return {
-            date: b.date,
-            open: b.open,
-            high: b.high,
-            low: b.low,
-            close: b.close,
-            volume: b.volume,
-            sma10: sma10[fullIdx],
-            sma20: sma20[fullIdx],
-          };
+          const fi = bars.length - arr.length + i;
+          return { date: b.date, open: b.open, high: b.high, low: b.low,
+                   close: b.close, volume: b.volume,
+                   sma10: sma10v[fi], sma20: sma20v[fi] };
         }),
       });
+
+      debug.push(`✓ ${c.symbol} score=${score}`);
     } catch (e) {
-      console.warn(`Skipping ${c.symbol}: ${e.message}`);
+      // silently skip
     }
 
-    if (results.length >= limit * 3) break; // safety cap on API usage
+    if (results.length >= limit * 3 || processed >= MAX_CANDIDATES) break;
   }
 
   results.sort((a, b) => b.score - a.score);
 
   return {
-    generatedAt: new Date().toISOString(),
+    generatedAt:    new Date().toISOString(),
     bullishSectors,
-    totalScreened: candidates.length,
+    totalScreened:  processed,
     totalQualified: results.length,
     debug,
-    results: results.slice(0, limit),
+    results:        results.slice(0, limit),
   };
 }
 
