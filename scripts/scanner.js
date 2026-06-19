@@ -100,18 +100,21 @@ async function getBullishSectors(apiKey) {
   return FALLBACK_BULLISH_SECTORS;
 }
 
-// Run the FMP stock screener with our base liquidity/price/momentum filters.
-// Sector filtering is applied after, since the screener endpoint only accepts
-// a single sector value at a time.
-async function runScreener(apiKey, bullishSectors) {
+// Run the FMP stable company-screener.
+// The stable endpoint supports: marketCapMoreThan, country, exchange,
+// isEtf, isFund, isActivelyTrading, sector, limit.
+// Price, volume, and ADR filters are applied afterwards on the historical data.
+async function runScreener(apiKey, bullishSectors, debug = []) {
   const exchanges = ['NASDAQ', 'NYSE', 'AMEX'];
   const seen = new Map();
 
   for (const exchange of exchanges) {
     const params = new URLSearchParams({
-      priceMoreThan: String(FILTERS.minPrice),
-      volumeMoreThan: '500000', // rough pre-filter; refined later with price*vol
+      marketCapMoreThan: '50000000', // $50M+ market cap as a basic liquidity proxy
+      country: 'US',
       isActivelyTrading: 'true',
+      isEtf: 'false',
+      isFund: 'false',
       exchange,
       limit: '1000',
       apikey: apiKey,
@@ -119,16 +122,30 @@ async function runScreener(apiKey, bullishSectors) {
 
     try {
       const results = await fmpFetch(`${FMP_STABLE}/company-screener?${params.toString()}`);
-      for (const r of results) {
-        if (!seen.has(r.symbol)) seen.set(r.symbol, r);
+      const count = Array.isArray(results) ? results.length : 'non-array';
+      debug.push(`${exchange}: ${count} results`);
+      if (Array.isArray(results)) {
+        for (const r of results) {
+          if (!seen.has(r.symbol)) seen.set(r.symbol, r);
+        }
+      } else {
+        debug.push(`${exchange} response sample: ${JSON.stringify(results).slice(0, 200)}`);
       }
     } catch (e) {
-      console.warn(`Screener fetch failed for exchange ${exchange}: ${e.message}`);
+      debug.push(`${exchange} fetch failed: ${e.message}`);
     }
   }
 
   const all = Array.from(seen.values());
-  return all.filter((r) => bullishSectors.includes(r.sector));
+  const sectorFiltered = all.filter((r) => bullishSectors.includes(r.sector));
+
+  debug.push(`Total unique: ${all.length}, after sector filter: ${sectorFiltered.length}`);
+  if (all.length > 0) {
+    const sampleSectors = [...new Set(all.slice(0, 100).map((r) => r.sector))].filter(Boolean);
+    debug.push(`Sample sectors: ${sampleSectors.join(', ')}`);
+  }
+
+  return sectorFiltered;
 }
 
 // Get ~9 months of daily candles for a symbol.
@@ -348,8 +365,9 @@ function scorePattern(bars) {
 // ---- Main scan ---------------------------------------------------------------
 
 async function scan(apiKey, { limit = 40, onProgress = null } = {}) {
+  const debug = [];
   const bullishSectors = await getBullishSectors(apiKey);
-  const candidates = await runScreener(apiKey, bullishSectors);
+  const candidates = await runScreener(apiKey, bullishSectors, debug);
 
   const results = [];
   let processed = 0;
@@ -385,7 +403,7 @@ async function scan(apiKey, { limit = 40, onProgress = null } = {}) {
 
       results.push({
         symbol: c.symbol,
-        name: c.companyName,
+        name: c.name || c.companyName || c.symbol,
         sector: c.sector,
         industry: c.industry,
         price: last.close,
@@ -425,6 +443,7 @@ async function scan(apiKey, { limit = 40, onProgress = null } = {}) {
     bullishSectors,
     totalScreened: candidates.length,
     totalQualified: results.length,
+    debug,
     results: results.slice(0, limit),
   };
 }
