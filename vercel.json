@@ -1,6 +1,11 @@
 {
   "buildCommand": null,
   "outputDirectory": "public",
+  "functions": {
+    "api/scan.js": {
+      "maxDuration": 60
+    }
+  },
   "rewrites": [
     { "source": "/(.*)", "destination": "/$1" }
   ]
