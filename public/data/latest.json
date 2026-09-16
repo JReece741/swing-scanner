@@ -1,17 +1,15 @@
 {
-  "generatedAt": "2026-09-15T23:30:07.789Z",
+  "generatedAt": "2026-09-16T17:42:14.405Z",
   "bullishSectors": [
+    "Basic Materials",
     "Communication Services",
-    "Consumer Defensive",
-    "Financial Services",
-    "Healthcare",
-    "Industrials",
-    "Technology"
+    "Energy",
+    "Real Estate"
   ],
   "totalScreened": 0,
   "totalQualified": 0,
   "debug": [
-    "Bullish sectors (2026-09-14): Communication Services, Consumer Defensive, Financial Services, Healthcare, Industrials, Technology",
+    "Bullish sectors (2026-09-15): Basic Materials, Communication Services, Energy, Real Estate",
     "FMP 402 stock-list: Restricted Endpoint: This endpoint is not available under your current subscription please visit our subscription page to upgrade your plan at https://financialmodelingprep.com/",
     "stock-list fatal: FMP 402 stock-list: Restricted Endpoint: This endpoint is not available under your current subscription please visit our subscription page to upgrade your plan at https://financialmodelingprep.com/"
   ],
