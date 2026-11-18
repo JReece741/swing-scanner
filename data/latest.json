@@ -1,12 +1,13 @@
 {
-  "generatedAt": "2026-11-17T22:34:08.718Z",
+  "generatedAt": "2026-11-18T02:18:34.123Z",
   "bullishSectors": [
-    "Real Estate"
+    "Healthcare",
+    "Industrials"
   ],
   "totalScreened": 0,
   "totalQualified": 0,
   "debug": [
-    "Bullish sectors (2026-11-16): Real Estate",
+    "Bullish sectors (2026-11-17): Healthcare, Industrials",
     "FMP 402 stock-list: Restricted Endpoint: This endpoint is not available under your current subscription please visit our subscription page to upgrade your plan at https://financialmodelingprep.com/",
     "stock-list fatal: FMP 402 stock-list: Restricted Endpoint: This endpoint is not available under your current subscription please visit our subscription page to upgrade your plan at https://financialmodelingprep.com/"
   ],
